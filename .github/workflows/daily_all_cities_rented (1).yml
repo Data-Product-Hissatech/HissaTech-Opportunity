@@ -1,0 +1,159 @@
+name: Daily All Cities - Rented + Owner Detection
+
+on:
+  schedule:
+    - cron: '0 21 * * *'   # يوميًا 9 مساءً (نفس توقيت البايبلاين الأساسي بالمشروع)
+  workflow_dispatch:
+
+concurrency:
+  group: daily-all-cities-rented
+  cancel-in-progress: false
+
+jobs:
+  # ══════════════════════════════════════════════════════════
+  # الرياض -- سلسلة كاملة (سحب + تنظيف + استخراج مؤجّرة + من المالك بعمود واحد)
+  # ══════════════════════════════════════════════════════════
+  riyadh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install pandas requests beautifulsoup4 lxml scikit-learn
+
+      - name: 1) Scrape sale listings (apartments)
+        run: python scraper_sale.py
+      - name: 2) Fix price (NLP)
+        run: python fix_price_nlp.py
+      - name: 3) Fix area (NLP)
+        run: python fix_area_nlp.py
+      - name: 4) Finalize area
+        run: python finalize_area.py
+      - name: 5) Cross-check area
+        run: python cross_check_area.py
+      - name: 6) Fix rooms/bathrooms
+        run: python fix_rooms_bathrooms_sale.py
+      - name: 7) Detect anomalies
+        run: python detect_anomalies.py
+      - name: 8) Merge final report
+        run: python merge_final_report.py
+
+      - name: Commit Riyadh results
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/
+          git commit -m "Riyadh: scrape -> clean" || echo "No changes"
+          for i in 1 2 3 4 5; do
+            git pull --rebase origin main && git push && break
+            sleep 5
+          done
+
+  # ══════════════════════════════════════════════════════════
+  # الرياض -- باقي الأنواع (فلل، أدوار، عمائر، مكاتب، أراضي)
+  # سحب متوازي (matrix) + تنظيف + استخراج مؤجّرة بعمود المالك
+  # ══════════════════════════════════════════════════════════
+  riyadh_scrape_other_types:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        property_type:
+          - { script: scraper_villa.py,    key: villa }
+          - { script: scraper_floor.py,    key: floor }
+          - { script: scraper_land.py,     key: land }
+          - { script: scraper_building.py, key: building }
+          - { script: scraper_office.py,   key: office }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install pandas requests beautifulsoup4 lxml
+      - name: Scrape ${{ matrix.property_type.key }}
+        run: python ${{ matrix.property_type.script }}
+      - name: Commit ${{ matrix.property_type.key }} raw data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/listings_${{ matrix.property_type.key }}.csv
+          git commit -m "Riyadh: scrape ${{ matrix.property_type.key }}" || echo "No changes"
+          for i in 1 2 3 4 5; do
+            git pull --rebase origin main && git push && break
+            sleep 5
+          done
+
+  riyadh_clean_and_extract_other_types:
+    needs: riyadh_scrape_other_types
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install pandas scikit-learn
+      - name: Clean property types (anomaly exclusion)
+        run: python clean_property_types.py
+      - name: Commit other-types results
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/
+          git commit -m "Riyadh other types: clean" || echo "No changes"
+          for i in 1 2 3 4 5; do
+            git pull --rebase origin main && git push && break
+            sleep 5
+          done
+
+  # ══════════════════════════════════════════════════════════
+  # باقي المدن (14) -- كشف شذوذ فقط (السحب له workflows منفصلة كل ساعتين)
+  # ══════════════════════════════════════════════════════════
+  detect_anomalies_cities:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install pandas scikit-learn
+      - name: Detect anomalies for all cities
+        run: |
+          for city in medina jeddah mecca dammam khobar dhahran jubail ahsa qatif jazan khamis_mushait abha buraidah taif; do
+            python detect_anomalies_city_no_api.py "$city"
+          done
+      - name: Commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/
+          git commit -m "Cities: detect anomalies" || echo "No changes"
+          for i in 1 2 3 4 5; do
+            git pull --rebase origin main && git push && break
+            sleep 5
+          done
+
+  # ══════════════════════════════════════════════════════════
+  # استخراج المؤجّرة + المالك المباشر لكل المدن (الرياض + 14) بسكربت واحد
+  # ينتج: rented_<city>_no_api.csv لكل مدينة + rented_all_cities_no_api.csv
+  # ══════════════════════════════════════════════════════════
+  extract_rented:
+    needs: [riyadh, riyadh_clean_and_extract_other_types, detect_anomalies_cities]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install pandas
+      - run: python rented_no_api.py all
+      - name: Commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/
+          git commit -m "Rented + owner detection: all cities" || echo "No changes"
+          for i in 1 2 3 4 5; do
+            git pull --rebase origin main && git push && break
+            sleep 5
+          done
